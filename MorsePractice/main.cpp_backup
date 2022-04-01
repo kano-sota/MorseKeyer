@@ -1,0 +1,265 @@
+/*
+ * MorsePractice.cpp
+ *
+ * Created: 2021/11/13 23:51:42
+ * Author : JJ1MDY
+ */ 
+#define F_CPU 8000000UL	// System clock = 8MHz
+// Fuses E:FF, H:DF, L:E4 (ATTiny2313)
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/pgmspace.h>
+#include <util/delay.h>
+
+#define DOT 1
+#define DASH 2
+#define TICK_INTERVAL 100	// Timer1 interrupt interval time [us]
+#define SINE_TABLE_N 156	// f_carrier(31.25kHz) / f_step(100Hz) / 2 = 156
+
+volatile uint8_t tick_flag = 0;
+volatile uint8_t dot_input_flag = 0;
+volatile uint8_t dash_input_flag = 0;
+volatile uint8_t tone_rst_flag = 0;
+
+volatile uint16_t tone_freq = 0;	// 5 - 10 [unit: 100Hz]
+volatile uint8_t tone_volume = 0;	// 0 - 5 [logarithm]
+
+
+const uint8_t sine_table[SINE_TABLE_N] PROGMEM = {0, 2, 5, 7, 10, 12, 15, 17, 20, 22, 25, 27, 30, 32, 35, 37, 40, 42, 45, 47, 49, 52, 54, 56, 59, 61, 63, 65, 67, 70, 72, 74, 76, 78, 80, 82, 84, 86, 87, 89, 91, 93, 95, 96, 98, 99, 101, 103, 104, 105, 107, 108, 109, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 121, 122, 123, 123, 124, 124, 125, 125, 126, 126, 126, 126, 126, 126, 127, 126, 126, 126, 126, 126, 126, 125, 125, 124, 124, 123, 123, 122, 121, 121, 120, 119, 118, 117, 116, 115, 114, 113, 112, 111, 109, 108, 107, 105, 104, 103, 101, 99, 98, 96, 95, 93, 91, 89, 87, 86, 84, 82, 80, 78, 76, 74, 72, 70, 67, 65, 63, 61, 59, 56, 54, 52, 49, 47, 45, 42, 40, 37, 35, 32, 30, 27, 25, 22, 20, 17, 15, 12, 10, 7, 5, 2};
+
+void GPIO_init();
+void Timer_init();
+
+void Tick_on();
+void Tick_off();
+
+void Tone_on();
+void Tone_off();
+void PWM_valueset();
+
+uint8_t ReadInput_dot()  { return !(PINB&(1<<PINB1)); }
+uint8_t ReadInput_dash() { return !(PINB&(1<<PINB0)); }
+void WriteOutput_keyout(uint8_t bit) { bit?(PORTD |= 1<<PIND0):(PORTD &= ~(1<<PIND0)); return; }
+
+void Paddle_keying(uint16_t period);
+
+uint8_t Dot_function(uint16_t period);
+uint8_t Dash_function(uint16_t period);
+
+uint16_t WPM_to_period(uint8_t WPM);
+
+
+int main(void) {
+	uint8_t WPM = 24;
+	
+	GPIO_init();
+	Timer_init();
+	sei();
+	
+    Tick_on();
+	
+	tone_freq = 800/100;
+	tone_volume = 5;
+	
+    while (1) {
+		if (tick_flag) {
+			Paddle_keying(WPM_to_period(WPM));
+			tick_flag = 0;
+		}
+    }
+}
+
+void GPIO_init() {
+	DDRB = 0xfc; // Input: PB0, PB1
+	DDRD = 0xff;
+	PORTB = 0x03; // Pull-up: PB0,PB1
+	PORTD = 0x00;
+}
+
+void Timer_init() {
+	// Timer0 settings
+	// For generate PWM sine-wave
+	TCCR0A = 0x23;	// COM0B = 0b10 (output from OC0B-pin), WGM0 = 0b011 (8bit PWM)
+	TCCR0B = 0x00;	// not divide (stop at first)
+	OCR0B = 0;
+	
+	// Timer1 settings
+	// For make tick
+	TCCR1A = 0x00;	// standard mode (not PWM)
+	TCCR1B = 0x08;	// not divide (stop at first)
+	OCR1A = 8 * TICK_INTERVAL;	// [us]
+	
+	TIMSK = (1<<TOIE0) | (1<<OCIE1A);	// Timer0 Overflow Interrupt & Timer1 Compare A Match Interrupt
+}
+void Tick_on() {
+	TCCR1B |= 1<<CS10;	// start Timer1
+}
+void Tick_off() {
+	TCCR1B &= ~(1<<CS10);	// stop Timer1
+}
+void Tone_on() {
+	TCCR0B |= 1<<CS00;	// start Timer0
+	tone_rst_flag = 1;	// reset n
+}
+void Tone_off() {
+	TCCR0B &= ~(1<<CS00);	// stop Timer0
+}
+
+void PWM_valueset(uint8_t value) {
+	OCR0B = value;
+}
+
+void Paddle_keying(uint16_t period) {
+	static uint8_t state = 0;
+
+	// set flag
+	if (ReadInput_dot()) dot_input_flag  = 1;
+	if (ReadInput_dash()) dash_input_flag = 1;
+	
+	// set state when start keying
+	if (state == 0) {
+		if (dot_input_flag) state = DOT;
+		else if (dash_input_flag) state = DASH; 
+	}
+	
+	// execute keying function
+	if (state == DOT)  state = Dot_function(period);
+	else if (state == DASH) state = Dash_function(period);
+	
+	return;
+}
+
+uint8_t Dot_function(uint16_t period) {
+	// this function will be called at every timer-interrupt
+	
+	static uint8_t substate = 0;
+	static uint8_t nextstate = 0;
+	static uint16_t count = 0;
+	uint8_t period_flag = 0;
+	
+	count++;
+	
+	if (count >= period) {
+		period_flag = 1;
+		count = 0;
+	}
+	
+	if (substate == 0) {	// Start function
+		Tone_on();
+		WriteOutput_keyout(1);
+		nextstate = 0;
+		substate++;
+		count = 0;
+		
+	} else if (substate == 1) {	// Dot Output
+		if (period_flag) {
+			Tone_off();
+			WriteOutput_keyout(0);
+			substate++;
+			period_flag = 0;
+		}
+	} else if (substate == 2) {	// Space (& Check next input)
+		if (dash_input_flag) nextstate = DASH;		// move to Dash_function after space(1*period)
+		// else if (dot_input_flag) nextstate = DOT;	// repeat Dot_function after space(1*period)
+		else nextstate = 0;							// exit Dot_function and then stand-by
+		
+		if (period_flag) {
+			dot_input_flag = 0; dash_input_flag = 0;
+			substate = 0;
+			period_flag = 0;
+			return nextstate;
+		}
+	}
+	return DOT;	// continue dot_function
+}
+uint8_t Dash_function(uint16_t period) {
+	// this function will be called at every timer-interrupt
+	
+	static uint8_t substate = 0;
+	static uint8_t nextstate = 0;
+	static uint16_t count = 0;
+	uint16_t period_flag = 0;
+	
+	count++;
+	
+	if (count >= period) {
+		period_flag = 1;
+		count = 0;
+	}
+	
+	if (substate == 0) {	// Start function
+		Tone_on();
+		WriteOutput_keyout(1);
+		nextstate = 0;
+		substate++;
+		count = 0;
+		
+	} else if (substate == 1) {	// Dash Output 1/3
+		if (period_flag) {
+			substate++;
+			period_flag = 0;
+		}
+		
+	} else if (substate == 2) {	// Dash Output 2/3
+		
+		if (period_flag) {
+			substate++;
+			period_flag = 0;
+		}
+		
+	} else if (substate == 3) {	// Dash Output 3/3 (& Check next "DOT" input)
+		if (dot_input_flag) nextstate = DOT;	// repeat Dot_function after space(1*period)
+	
+		if (period_flag) {
+			Tone_off();
+			WriteOutput_keyout(0);
+			substate++;
+			period_flag = 0;
+		}
+		
+	} else if (substate == 4) {	// Space (& Check next input)
+		if (dot_input_flag) nextstate = DOT;		// move to Dot_function after space(1*period)
+		// else if (dash_input_flag) nextstate = DASH;	// repeat Dash_function after space(1*period)
+		else nextstate = 0;						// exit Dot_function and then standby
+		
+		if (period_flag) {
+			dot_input_flag = 0; dash_input_flag = 0;
+			substate = 0;
+			period_flag = 0;
+			return nextstate;
+		}
+	}
+	return DASH;	// continue dot_function
+}
+
+uint16_t WPM_to_period(uint8_t WPM) {
+	// Dot[s] = 60[s] / (50 * WPM)
+	// period = Dot[us] / TICK_INTERVAL[us]
+	return 60000 / (50 * (uint16_t)WPM) * 1000 / TICK_INTERVAL;
+}
+
+void Generate_sine() {
+	static uint16_t n = 0;
+	uint8_t out = 0;
+	
+	n += tone_freq;
+	if (n >= (SINE_TABLE_N << 1)) { n -= (SINE_TABLE_N << 1); tone_rst_flag = 0; }
+		
+	if (n < SINE_TABLE_N) {
+		out = 128 + (pgm_read_byte(sine_table + n) >> (tone_rst_flag?6:5 - tone_volume));
+	} else if (n < (SINE_TABLE_N << 1)) {
+		out = 128 - (pgm_read_byte(sine_table + n - SINE_TABLE_N) >> (tone_rst_flag?6:5 - tone_volume));
+	}
+	
+	PWM_valueset(out);
+}
+
+// Timer Interrupt
+ISR(TIMER0_OVF_vect) {
+	Generate_sine();
+}
+
+ISR(TIMER1_COMPA_vect) {
+	tick_flag = 1;
+}
