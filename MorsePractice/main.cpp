@@ -5,12 +5,16 @@
  * Author : JJ1MDY
  */ 
 #define F_CPU 8000000UL	// System clock = 8MHz
-// Fuses E:FF, H:DF, L:E4 (ATTiny2313)
+// Fuses E:FF, H:DF, L:E2 (ATmega328p)
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 #include <util/delay.h>
+#include <util/twi.h>
+#include <stdio.h>
+#include "myI2C.h"
+#include "myLCD_ST7032.h"
 
 #define DOT 1
 #define DASH 2
@@ -43,9 +47,9 @@ uint8_t Dash_function(uint16_t period);
 
 uint16_t WPM_to_wavenum(uint8_t WPM);
 
-uint8_t ReadInput_dot()  { return !(PINB&(1<<PINB1)); }
-uint8_t ReadInput_dash() { return !(PINB&(1<<PINB0)); }
-void WriteOutput_keyout(uint8_t bit) { bit?(PORTD |= 1<<PIND0):(PORTD &= ~(1<<PIND0)); return; }
+uint8_t ReadInput_dot()  { return !(PIND&(1<<PIND6)); }
+uint8_t ReadInput_dash() { return !(PIND&(1<<PIND7)); }
+void WriteOutput_keyout(uint8_t bit) { bit?(PORTB |= 1<<PINB0):(PORTB &= ~(1<<PINB0)); return; }
 
 int main(void) {
 	uint8_t WPM = 24;
@@ -53,6 +57,8 @@ int main(void) {
 	
 	GPIO_init();
 	Timer_init();
+	I2C_Init();
+	I2C_LCD_Init();
 	sei();
 	
     Tick_on();
@@ -72,10 +78,12 @@ int main(void) {
 }
 
 void GPIO_init() {
-	DDRB = 0xfc; // Input: PB0, PB1
-	DDRD = 0xff;
-	PORTB = 0x03; // Pull-up: PB0,PB1
-	PORTD = 0x00;
+	DDRB = 0xff; // LED: PB0
+	DDRC = 0xfe; // Volume: PC0
+	DDRD = 0x3f; // Key-input: PD6(dot) & PD7(dash)
+	PORTB = 0x00;
+	PORTC = 0x00;
+	PORTD = 0xc0; // Pull-up: PB0,PB1
 }
 
 void Timer_init() {
@@ -91,7 +99,8 @@ void Timer_init() {
 	TCCR1B = 0x08;	// not divide (stop at first)
 	OCR1A = 8 * TICK_INTERVAL;	// [us]
 	
-	TIMSK = (1<<TOIE0) | (1<<OCIE1A);	// Timer0 Overflow Interrupt & Timer1 Compare A Match Interrupt
+	TIMSK0 = (1<<TOIE0);	// Timer0 Overflow Interrupt
+	TIMSK1 = (1<<OCIE1A);	// Timer1 Compare A Match Interrupt
 }
 void Tick_on() {
 	TCCR1B |= 1<<CS10;	// start Timer1
