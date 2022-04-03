@@ -75,6 +75,7 @@ int main(void) {
 	
 	Tick_on();
 	I2C_LCD_SendString(0x00, line_buffer, 16);
+	I2C_LCD_Cursor_OnOff(1, 0);
 	
 	while (1) {
 		
@@ -92,7 +93,7 @@ int main(void) {
 			char_id = (char_id << 1) + 1;
 			blank_count = 0;
 		} else {
-			if (blank_count > BLANK_CHAR && char_id > 1) {
+			if (blank_count > BLANK_CHAR && char_id != 1) {
 				PrintChar(char_id);
 				char_id = 1;
 			}
@@ -228,20 +229,28 @@ uint16_t WPM_to_wavenum(uint8_t WPM) {
 }
 
 void PrintChar(uint8_t char_id) {
-	static uint8_t cursor_pos = 15;
+	static uint8_t cursor_pos = 0x0F;
 	char c;
 	
-	if (cursor_pos == 0) {
+	if (char_id == 0 && cursor_pos > 0x00) { // backspace
+		cursor_pos = cursor_pos == 0x40 ? 0x0F : cursor_pos - 1;
+
+		c = ' ';
+		I2C_LCD_SendString(cursor_pos, &c, 1);
+		I2C_LCD_Cursor_Shift(0, 1);
+	} else if (char_id != 0) {
+		c = char_id <= 128 ? pgm_read_byte(decoded_char_table + char_id) : '#';
+		I2C_LCD_SendString(cursor_pos, &c, 1);
+		line_buffer[cursor_pos & 0x0F] = c;
+	
+		++cursor_pos;
+	}
+	
+	if (cursor_pos == 0x50) {
 		I2C_LCD_Clear();
 		I2C_LCD_SendString(0x00, line_buffer, 16);
 	}
-	
-	c = char_id <= 128 ? pgm_read_byte(decoded_char_table + char_id) : '#';
-	I2C_LCD_SendString(0x40 + cursor_pos, &c, 1);
-	line_buffer[cursor_pos] = c;
-	
-	++cursor_pos;
-	cursor_pos &= 0x0F;
+	if (cursor_pos & 0x10) cursor_pos = 0x40;
 }
 
 // Timer Interrupt
